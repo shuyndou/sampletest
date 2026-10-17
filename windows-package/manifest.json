@@ -1,5 +1,6 @@
 {
-  "sha256": "96db58ee16f4e8c138ce1300ccef800c61e3af9a6eb2c7a1e077847c3a8d7459",
+  "version": "1.1.0",
+  "sha256": "9eb4d8cd8a325a52d8ab756c2471627b81411cd8b21e3fe4c47525930dd476a3",
   "parts": [
     {
       "name": "Pagefolio.zip.part001",
@@ -15,7 +16,7 @@
     },
     {
       "name": "Pagefolio.zip.part004",
-      "size": 31842674
+      "size": 32871242
     }
   ]
 }

@@ -1,7 +1,9 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
-const { PDFDocument } = require('pdf-lib');
+const { createWriteStream } = require('node:fs');
+const { pipeline } = require('node:stream/promises');
+const PDFDocument = require('pdfkit');
 
 function normalizeUrl(input) {
   if (typeof input !== 'string' || !input.trim()) throw new Error('URLを入力してください。');
@@ -15,14 +17,14 @@ function normalizeUrl(input) {
 
 function validateOptions(input) {
   if (!input || !['scroll', 'click', 'key'].includes(input.mode)) throw new Error('ページ送り方式を選んでください。');
-  const maxPages = Number(input.maxPages);
-  const delay = Number(input.delay);
-  const overlap = Number(input.overlap);
-  if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 500) throw new Error('上限枚数は1〜500枚です。');
+  const delay = Number(input.delay ?? 500);
+  const overlap = Number(input.overlap ?? 10);
   if (!Number.isFinite(delay) || delay < 500 || delay > 60000) throw new Error('待ち時間は0.5〜60秒です。');
   if (!Number.isFinite(overlap) || overlap < 0 || overlap > 40) throw new Error('重なりは0〜40%です。');
   if (input.mode === 'key' && !['Right', 'Left', 'PageDown', 'Space'].includes(input.key)) throw new Error('利用できないキーです。');
-  return { mode: input.mode, maxPages, delay, overlap, key: input.key || 'Right' };
+  const nextSelector = String(input.nextSelector || '').trim();
+  if (nextSelector.length > 500) throw new Error('次へボタンの指定が長すぎます。');
+  return { mode: input.mode, delay, overlap, key: input.key || 'Right', nextSelector };
 }
 
 function wait(ms, signal) {
@@ -37,30 +39,41 @@ function wait(ms, signal) {
 // Only the injected driver interacts with the browser. A stopped run keeps its frames.
 async function collectFrames({ driver, options, directory, signal, onProgress = () => {} }) {
   const frames = [];
-  let previousHash;
-  let reason = 'limit';
+  let previousHash, previousMarker;
+  const recent = [];
+  let reason = 'unchanged';
   let error;
   try {
     await driver.settle(options.delay, signal);
-    while (!signal.aborted && frames.length < options.maxPages) {
+    while (!signal.aborted) {
+      let probe = await driver.inspect?.(options) || {};
       let frame = await driver.capture();
       let hash = createHash('sha256').update(frame.bytes).digest('hex');
-      // Allow a slow page another full interval, without clicking again and skipping a page.
-      if (hash === previousHash) {
+      const unchanged = () => previousHash && ((probe.reliable && probe.marker === previousMarker) || (hash === previousHash && (probe.marker === undefined || probe.marker === previousMarker)));
+      // Retry without advancing: a slow render must not cause another page to be skipped.
+      for (let retry = 0; unchanged() && retry < 3 && !signal.aborted; retry++) {
         await driver.settle(options.delay, signal);
-        if (signal.aborted) break;
+        probe = await driver.inspect?.(options) || {};
         frame = await driver.capture();
         hash = createHash('sha256').update(frame.bytes).digest('hex');
-        if (hash === previousHash) { reason = 'unchanged'; break; }
       }
       if (signal.aborted) break;
+      if (unchanged()) { reason = probe.atEnd ? 'end' : 'unchanged'; break; }
+      const signature = `${hash}|${probe.marker ?? ''}`;
+      if (!probe.reliable && recent.includes(signature)) { reason = 'cycle'; break; }
       const filename = path.join(directory, `${String(frames.length + 1).padStart(4, '0')}.jpg`);
       await fs.writeFile(filename, frame.bytes);
       frames.push({ filename, width: frame.width, height: frame.height });
       previousHash = hash;
+      previousMarker = probe.marker;
+      recent.push(signature);
+      if (recent.length > 12) recent.shift();
       onProgress(frames.length);
-      if (signal.aborted || frames.length >= options.maxPages) break;
-      await driver.advance(options);
+      if (signal.aborted) break;
+      // A disabled next control is explicit; scroll bottoms are retried for lazy loading.
+      if (probe.explicitEnd) { reason = 'end'; break; }
+      const advanced = await driver.advance(options);
+      if (advanced === false) { reason = 'end'; break; }
       await driver.settle(options.delay, signal);
     }
   } catch (e) { error = e; reason = 'error'; }
@@ -70,20 +83,23 @@ async function collectFrames({ driver, options, directory, signal, onProgress = 
 
 async function writePdf(frames, output, title) {
   if (!frames.length) throw new Error('保存できる画面がありません。');
-  const doc = await PDFDocument.create();
-  doc.setTitle(title || 'Pagefolio capture');
-  doc.setCreator('Pagefolio');
-  for (const frame of frames) {
-    const jpg = await doc.embedJpg(await fs.readFile(frame.filename));
-    const width = frame.width * 0.75;
-    const height = frame.height * 0.75;
-    doc.addPage([width, height]).drawImage(jpg, { x: 0, y: 0, width, height });
-  }
   const temp = `${output}.${randomUUID()}.tmp`;
+  const doc = new PDFDocument({ autoFirstPage: false, bufferPages: false, info: { Title: title || 'Pagefolio capture', Creator: 'Pagefolio' } });
+  const completion = pipeline(doc, createWriteStream(temp, { flags: 'wx' }));
+  completion.catch(() => {});
   try {
-    await fs.writeFile(temp, await doc.save(), { flag: 'wx' });
+    for (const frame of frames) {
+      if (doc.destroyed) { await completion; throw new Error('PDFの書き込みが中断されました。'); }
+      const width = frame.width * 0.75, height = frame.height * 0.75;
+      doc.addPage({ size: [width, height], margin: 0 });
+      doc.image(await fs.readFile(frame.filename), 0, 0, { width, height });
+      // PDFKit pushes into a readable stream; respect slow disks instead of buffering the whole book.
+      while (doc.readableLength > 16 * 1024 * 1024 && !doc.destroyed) await wait(10);
+    }
+    doc.end();
+    await completion;
     await fs.rename(temp, output);
-  } finally { await fs.rm(temp, { force: true }); }
+  } finally { doc.destroy(); await completion.catch(() => {}); await fs.rm(temp, { force: true }); }
 }
 
 module.exports = { normalizeUrl, validateOptions, wait, collectFrames, writePdf };

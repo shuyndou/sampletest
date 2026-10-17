@@ -10,6 +10,12 @@ const outputRoot = path.resolve('test-results');
 app.setPath('userData', path.join(outputRoot, 'electron-data'));
 app.commandLine.appendSwitch('disable-gpu');
 const server = http.createServer((req, res) => {
+  if (req.url === '/frame') {
+    res.setHeader('Content-Type', 'text/html');
+    res.end(`<html><body style="margin:0"><iframe style="width:100vw;height:100vh;border:0" src="http://localhost:${server.address().port}/scroll"></iframe></body></html>`);
+    return;
+  }
+  if (req.url === '/unavailable') res.statusCode = 503;
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.end(`<!doctype html><html><head><title>Pagefolio Test Book</title><style>
     *{box-sizing:border-box}html,body{margin:0;font-family:sans-serif;scroll-behavior:auto}body{background:#faf9ef;color:#203a30}
@@ -40,10 +46,10 @@ async function main() {
     assert.equal(result.ok, true, JSON.stringify(result));
     await until(() => !getState().loading, 'load');
   };
-  const run = async (name, mode, maxPages = 10) => {
+  const run = async (name, mode) => {
     const output = path.join(outputRoot, `${name}.pdf`);
     dialog.showSaveDialog = async () => ({ canceled: false, filePath: output });
-    const result = await ui(`window.pagefolio.start(${JSON.stringify({ mode, maxPages, delay: 500, overlap: 0, key: 'Right' })})`);
+    const result = await ui(`window.pagefolio.start(${JSON.stringify({ mode, delay: 500, overlap: 0, key: 'Right' })})`);
     assert.equal(result.ok, true, JSON.stringify(result));
     await until(() => !['choosing', 'recording', 'saving'].includes(getState().phase), name);
     await getJob();
@@ -58,8 +64,12 @@ async function main() {
   console.log('PASS: site renderer is isolated from Node and app IPC');
   let pdf = await run('scroll', 'scroll');
   assert.equal(pdf.getPageCount(), 3);
-  assert.equal(getState().reason, 'unchanged');
+  assert.equal(getState().reason, 'end');
   console.log('PASS: native scrolling, bottom detection, 3-page PDF');
+  await open('/frame');
+  pdf = await run('cross-origin-scroll', 'scroll');
+  assert.equal(pdf.getPageCount(), 3);
+  console.log('PASS: cross-origin iframe scrolls its own document and detects its own end');
 
   await open('/click');
   // Position picking goes through the actual sandboxed UI bridge and a real mouse click.
@@ -81,11 +91,9 @@ async function main() {
   assert.equal(pdf.getPageCount(), 3);
   console.log('PASS: keyboard page turn, 3-page PDF');
 
-  await open('/key');
-  pdf = await run('limited', 'key', 2);
-  assert.equal(pdf.getPageCount(), 2);
-  assert.equal(getState().reason, 'limit');
-  console.log('PASS: requested page limit');
+  assert.equal(await ui('document.getElementById("max-pages")'), null);
+  assert.equal(await ui('document.getElementById("delay").value'), '0.5');
+  console.log('PASS: page limit removed from UI; 0.5 second default');
 
   await open('/scroll');
   dialog.showSaveDialog = async () => ({ canceled: false, filePath: path.join(outputRoot, 'stopped.pdf') });
@@ -131,8 +139,82 @@ async function main() {
   await until(() => ui('document.getElementById("status-text").textContent === "保存を完了できませんでした"'), 'UI error status');
   await fs.writeFile(path.join(outputRoot, 'desktop-browser.png'), (await window.webContents.capturePage()).toPNG());
   await fs.writeFile(path.join(outputRoot, 'captured-page.png'), (await browser.webContents.capturePage()).toPNG());
+
+  const batchDir = await fs.mkdtemp(path.join(outputRoot, 'batch-web-'));
+  await fs.writeFile(path.join(batchDir, 'Pagefolio Test Book.pdf'), 'existing file');
+  dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [batchDir] });
+  const urls = `${url}/key\n${url}/click\n${url}/unavailable\n名前?付き\t${url}/another`;
+  await ui('document.querySelector("[data-scope=web]").click()');
+  await until(() => ui('!document.getElementById("web-batch").hidden'), 'Web mode UI');
+  await ui(`document.getElementById('urls').value=${JSON.stringify(urls)};document.getElementById('import-urls').click()`);
+  await until(() => getState().queue.length === 4, 'URL import UI');
+  await ui('document.querySelector("[data-mode=key]").click();document.getElementById("start").click()');
+  await until(() => getState().batchActive, 'Web start UI');
+  let started;
+  await until(() => !getState().batchActive, 'web batch', 45000);
+  await getJob();
+  assert.deepEqual(getState().queue.map(item => item.status), ['review', 'review', 'failed', 'review']);
+  assert.equal(await fs.readFile(path.join(batchDir, 'Pagefolio Test Book.pdf'), 'utf8'), 'existing file');
+  for (const name of ['Pagefolio Test Book (2).pdf', 'Pagefolio Test Book (3).pdf', '名前_付き.pdf']) {
+    const doc = await PDFDocument.load(await fs.readFile(path.join(batchDir, name)));
+    assert.equal(doc.getPageCount(), 3);
+  }
+  assert.ok((await fs.readdir(batchDir)).some(name => name.startsWith('Pagefolio-result-')));
+  assert.equal(browser.webContents.getURL(), url + '/scroll');
+  console.log('PASS: Web URL queue, title filenames, duplicate protection, HTTP failure continuation, report, original page preserved');
+
+  const stopDir = await fs.mkdtemp(path.join(outputRoot, 'batch-stop-'));
+  dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [stopDir] });
+  await ui(`window.pagefolio.importUrls(${JSON.stringify(url + '/key\n' + url + '/click')})`);
+  await ui('window.pagefolio.startBatch({mode:"key",delay:5000,overlap:0,key:"Right"})');
+  await until(() => getState().count === 1 && getState().phase === 'recording', 'batch first page');
+  await ui('window.pagefolio.stop()'); await getJob();
+  assert.deepEqual(getState().queue.map(item => item.status), ['stopped', 'pending']);
+  pdf = await PDFDocument.load(await fs.readFile(getState().queue[0].output));
+  assert.equal(pdf.getPageCount(), 1);
+  console.log('PASS: batch stop saves partial PDF and leaves remaining URLs unrun');
+
+  // Simulated Kindle DOM only: intercept all HTTPS in this test session; never contact Amazon.
+  browser.webContents.session.protocol.handle('https', request => {
+    const target = new URL(request.url);
+    if (target.hostname !== 'read.amazon.co.jp') return new Response('blocked', { status: 403 });
+    if (target.pathname === '/kindle-library') return new Response(libraryFixture(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    return new Response(bookFixture(target.searchParams.get('asin')), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  });
+  const libraryUrl = 'https://read.amazon.co.jp/kindle-library?itemView=row&filter=test';
+  await ui('document.querySelector("[data-scope=kindle]").click()');
+  await until(() => ui('!document.getElementById("kindle-batch").hidden'), 'Kindle mode UI');
+  assert.equal((await ui(`window.pagefolio.open(${JSON.stringify(libraryUrl)})`)).ok, true);
+  await browser.webContents.executeJavaScript('document.getElementById("books").scrollTop = 40');
+  const scanned = await ui('window.pagefolio.scanLibrary()');
+  assert.equal(scanned.ok, true, JSON.stringify(scanned));
+  assert.deepEqual(getState().queue.map(item => item.asin), ['B000000001', 'B000000002', 'B000000003', 'B000000005']);
+  assert.equal(await browser.webContents.executeJavaScript('document.getElementById("books").scrollTop'), 40);
+  await fs.writeFile(path.join(outputRoot, 'desktop-batch.png'), (await window.webContents.capturePage()).toPNG());
+  const excluded = getState().queue.find(item => item.asin === 'B000000005');
+  await ui(`window.pagefolio.selectItem(${JSON.stringify(excluded.id)}, false)`);
+  const kindleDir = await fs.mkdtemp(path.join(outputRoot, 'batch-kindle-'));
+  dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [kindleDir] });
+  started = await ui('window.pagefolio.startBatch({mode:"key",delay:500,overlap:0,key:"Right",fromStart:true})');
+  assert.equal(started.ok, true, JSON.stringify(started));
+  await until(() => !getState().batchActive, 'Kindle simulated batch', 30000); await getJob();
+  assert.deepEqual(getState().queue.map(item => item.status), ['done', 'done', 'failed', 'pending']);
+  for (const name of ['本_一.pdf', '本_一 (2).pdf']) {
+    const doc = await PDFDocument.load(await fs.readFile(path.join(kindleDir, name)));
+    assert.equal(doc.getPageCount(), 3);
+  }
+  assert.equal(browser.webContents.getURL(), libraryUrl);
+  assert.equal(await browser.webContents.executeJavaScript('document.getElementById("books").scrollTop'), 40);
+  console.log('PASS: simulated Kindle filters, lazy list, titles, deselection, shared login session, beginning navigation, disabled-next end detection, skip unsupported book');
+  await browser.webContents.session.protocol.unhandle('https');
   window.close();
 }
 
-const watchdog = setTimeout(() => { console.error('Desktop test timed out'); app.exit(1); }, 90000);
+function libraryFixture() {
+  return `<!doctype html><html><head><title>Kindle filtered library fixture</title><style>body{margin:0}#books{height:500px;overflow:auto}article{height:230px;background:#ddd;margin:10px;padding:15px;box-sizing:border-box}</style></head><body><div id="books"><article data-asin="B000000001"><h3 class="book-title">本:一</h3></article><article data-asin="B000000002"><h3 class="book-title">本:一</h3></article><article data-asin="B000000003"><h3 class="book-title">先頭未対応</h3></article><article data-asin="B000000004" style="display:none"><h3>フィルター除外</h3></article></div><script>document.cookie='fixture-session=ok; path=/; SameSite=Lax';let added=false;const books=document.getElementById('books');books.addEventListener('scroll',()=>{if(!added&&books.scrollTop>150){added=true;setTimeout(()=>{books.insertAdjacentHTML('beforeend','<article data-asin="B000000005"><h3 class="book-title">遅延読み込み</h3></article>')},200)}})</script></body></html>`;
+}
+function bookFixture(asin) {
+  return `<!doctype html><html><head><title>Reader</title><style>body{background:#f8f4e9;color:#253c30;font:24px sans-serif;padding:60px}button{margin:10px;padding:10px}</style></head><body><div data-testid="reader"><h1 id="page">Chapter 2</h1><p>本:一</p></div>${asin === 'B000000003' ? '' : '<button id="beginning">本の先頭</button>'}<button id="next" aria-label="Next page">Next</button><script>let page=2;const next=document.getElementById('next');function render(){document.getElementById('page').textContent='Chapter '+page;next.disabled=page===3}function advance(){if(page<3){page++;render()}}next.onclick=advance;document.addEventListener('keydown',e=>{if(e.key==='ArrowRight')advance()});const beginning=document.getElementById('beginning');if(beginning)beginning.onclick=()=>{page=1;render()};if(!document.cookie.includes('fixture-session=ok'))document.body.innerHTML='<input type="password">';</script></body></html>`;
+}
+const watchdog = setTimeout(() => { console.error('Desktop test timed out'); app.exit(1); }, 180000);
 main().then(() => { clearTimeout(watchdog); server.close(); app.exit(0); }).catch(error => { clearTimeout(watchdog); console.error(error); server.close(); app.exit(1); });

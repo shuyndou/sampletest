@@ -28,7 +28,20 @@
   </header>
 
   <aside class="sidebar">
-    <div class="intro"><span class="eyebrow">YOUR PERSONAL WEB ARCHIVE</span><h1>ページを集めて、<br>ひとつのPDFに。</h1><p>いつものサイトを、そのまま手元に。</p></div>
+    <div class="intro"><span class="eyebrow">YOUR PERSONAL WEB ARCHIVE</span><h1>個別でも、一括でも。<br>末尾までPDFに。</h1><p>タイトルを付けて、このPCに保存。</p></div>
+    <div class="scope-switch" role="group" aria-label="保存モード"><button data-scope="single" class="active" aria-pressed="true">個別</button><button data-scope="kindle" aria-pressed="false">Kindle一括</button><button data-scope="web" aria-pressed="false">Web一括</button></div>
+    <section id="kindle-batch" class="batch-controls" hidden>
+      <button id="open-library" class="secondary full">Kindleライブラリを開く ↗</button>
+      <p class="micro">ログインして条件を絞り込み、行表示にしてください。現在の一覧を末尾まで読み取ります。</p>
+      <button id="scan-library" class="secondary full">絞り込み済み一覧を読み取る</button>
+      <label for="from-start">各本の開始位置</label><select id="from-start"><option value="start">本の先頭（移動できない本はスキップ）</option><option value="current">前回の読書位置</option></select>
+      <p class="micro">一覧は残したまま、各本を別の閲覧領域で開きます。縦書きの本はページ送りを左矢印に変更してください。</p>
+    </section>
+    <section id="web-batch" class="batch-controls" hidden>
+      <label for="urls">保存するURL（1行に1つ）</label><textarea id="urls" rows="5" placeholder="https://example.com/article-1&#10;https://example.com/article-2" spellcheck="false"></textarea>
+      <button id="import-urls" class="secondary full">URLを一覧に登録</button><p class="micro">PDF名には各ページのタイトルを使用します。「タイトル［タブ］URL」の入力も可能です。</p>
+    </section>
+    <section id="queue-panel" hidden><div class="queue-heading"><strong id="queue-count">0件</strong><span>チェックした対象を保存</span></div><div id="queue-list" class="queue-list"></div></section>
     <section class="settings">
       <div class="section-title"><span class="step">01</span><h2>ページの送り方</h2></div>
       <div class="mode-switch" role="group" aria-label="ページ送り方式">
@@ -38,15 +51,15 @@
       </div>
       <p id="mode-description" class="hint">画面を下にスクロールしながら保存します。</p>
       <div id="scroll-options" class="option-block"><label for="overlap">画面の重なり <span>読み飛ばし防止</span></label><div class="range-row"><input id="overlap" type="range" min="0" max="40" value="10" step="5"><output id="overlap-value">10%</output></div><p class="micro">ページ中央のスクロール領域を操作します。</p></div>
-      <div id="click-options" class="option-block" hidden><button id="pick" class="secondary full"><svg><use href="#i-click"/></svg><span id="pick-label">「次へ」の位置を選ぶ</span></button><p class="micro">右のページでクリックする位置を選択します。位置選択時はページ送りしません。</p></div>
+      <div id="click-options" class="option-block" hidden><button id="pick" class="secondary full"><svg><use href="#i-click"/></svg><span id="pick-label">「次へ」の位置を選ぶ</span></button><p class="micro">一括ではすべてのページに同じ位置を使います。</p><details><summary>ボタンのCSSセレクターで指定</summary><input id="next-selector" type="text" placeholder="例: button.next" aria-label="次へボタンのCSSセレクター"><p class="micro">指定時はクリック位置より優先します。</p></details></div>
       <div id="key-options" class="option-block" hidden><label for="key">ページを送るキー</label><select id="key"><option value="Right">→ 右矢印</option><option value="Left">← 左矢印</option><option value="PageDown">Page Down</option><option value="Space">Space</option></select><p class="micro">開始前にサイトの閲覧部分をクリックしてください。</p></div>
     </section>
 
     <section class="settings capture-settings">
       <div class="section-title"><span class="step">02</span><h2>保存の設定</h2></div>
-      <div class="two-columns"><div><label for="max-pages">上限枚数</label><div class="number-field"><input id="max-pages" type="number" min="1" max="500" value="100"><span>枚</span></div></div><div><label for="delay">操作後の待ち時間</label><div class="number-field"><input id="delay" type="number" min="0.5" max="60" step="0.5" value="2"><span>秒</span></div></div></div>
-      <div class="auto-stop"><svg><use href="#i-check"/></svg><span>同じ画面が続いたら自動で終了</span></div>
-      <p class="micro">現在の画面から取得します。画面の変化を検出できない場合は、上限枚数で停止します。</p>
+      <label for="delay">操作後の待ち時間</label><div class="number-field"><input id="delay" type="number" min="0.5" max="60" step="0.5" value="0.5"><span>秒</span></div>
+      <div class="auto-stop"><svg><use href="#i-check"/></svg><span>枚数制限なし・末尾を検出して終了</span></div>
+      <p class="micro">読み込みが遅い場合は待ち時間を増やしてください。末尾の確定ができなかったPDFは「要確認」として結果に残します。</p>
     </section>
 
     <div class="capture-actions">
@@ -54,7 +67,7 @@
       <button id="stop" class="stop-button full" hidden><span class="stop-square"></span>停止して、ここまで保存</button>
       <p class="local-note">データはこのPC内に保存されます</p>
     </div>
-    <div class="sidebar-footer"><span class="small-dot"></span><span>Pagefolio <span class="version">/ 1.0</span></span><span class="local-tag">LOCAL FIRST</span></div>
+    <div class="sidebar-footer"><span class="small-dot"></span><span>Pagefolio <span class="version">/ 1.1</span></span><span class="local-tag">LOCAL FIRST</span></div>
   </aside>
 
   <main class="workspace">
